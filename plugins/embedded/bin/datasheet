@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""datasheet - a shared, greppable library of datasheets / reference manuals / errata.
+
+Big PDFs (1000+ page reference manuals) don't fit in context. This converts each PDF
+into one text file per page so an agent can grep for a register or parameter and then
+read only the pages it needs - and cite page numbers. The library is shared across
+all projects (default ~/.local/share/datasheets, override with $DATASHEET_LIBRARY).
+
+  datasheet add ~/Downloads/rm0090.pdf --slug stm32f4-rm --title "STM32F4 Reference Manual RM0090"
+  datasheet add https://example.com/ds.pdf --slug bme280-ds
+  datasheet list
+  datasheet search "RCC_PLLCFGR" [--doc stm32f4-rm] [-C 2]
+  datasheet page stm32f4-rm 226 [228]
+  datasheet toc stm32f4-rm [filter]
+
+Text extraction uses `pdftotext` (poppler) when available, else pypdf via `uv`.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+LIB = Path(os.environ.get("DATASHEET_LIBRARY", Path.home() / ".local/share/datasheets")).expanduser()
+
+
+def slugify(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def extract_with_pdftotext(pdf: Path, out: Path) -> int:
+    info = subprocess.run(["pdfinfo", str(pdf)], capture_output=True, text=True).stdout
+    m = re.search(r"Pages:\s+(\d+)", info)
+    n = int(m.group(1)) if m else 0
+    with tempfile.TemporaryDirectory() as td:
+        txt = Path(td) / "all.txt"
+        subprocess.run(["pdftotext", "-layout", str(pdf), str(txt)], check=True)
+        pages = txt.read_text(errors="replace").split("\f")
+    count = 0
+    for i, body in enumerate(pages, 1):
+        if i > max(n, 1) and not body.strip():
+            continue
+        (out / f"p{i:04d}.txt").write_text(body)
+        count += 1
+    return count
+
+
+PYPDF_SCRIPT = r'''
+import sys, json
+from pathlib import Path
+from pypdf import PdfReader
+pdf, out = sys.argv[1], Path(sys.argv[2])
+r = PdfReader(pdf)
+for i, p in enumerate(r.pages, 1):
+    try: t = p.extract_text(extraction_mode="layout") or ""
+    except Exception: t = p.extract_text() or ""
+    (out / f"p{i:04d}.txt").write_text(t)
+toc = []
+def walk(items, depth=0):
+    for it in items:
+        if isinstance(it, list): walk(it, depth + 1); continue
+        try: toc.append({"depth": depth, "title": it.title, "page": r.get_destination_page_number(it) + 1})
+        except Exception: pass
+try: walk(r.outline)
+except Exception: pass
+(out / "toc.json").write_text(json.dumps(toc))
+print(len(r.pages))
+'''
+
+
+def extract_with_pypdf(pdf: Path, out: Path) -> int:
+    with tempfile.TemporaryDirectory() as td:
+        script = Path(td) / "extract.py"
+        script.write_text(PYPDF_SCRIPT)
+        try:
+            import pypdf  # noqa: F401
+            cmd = [sys.executable, "-I", str(script), str(pdf), str(out)]
+        except ImportError:
+            if not shutil.which("uv"):
+                sys.exit("need `pdftotext` (brew install poppler) or `uv` (to run pypdf)")
+            cmd = ["uv", "run", "--quiet", "--no-project", "--with", "pypdf", "python", "-I", str(script), str(pdf), str(out)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            sys.exit(f"pypdf extraction failed:\n{res.stderr}")
+        return int(res.stdout.strip().splitlines()[-1])
+
+
+def cmd_add(a):
+    src = a.source
+    LIB.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    if re.match(r"https?://", src):
+        tmp = Path(tempfile.mkdtemp()) / "doc.pdf"
+        req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0 (datasheet-tool)"})
+        with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        pdf = tmp
+    else:
+        pdf = Path(src).expanduser()
+        if not pdf.exists():
+            sys.exit(f"no such file: {pdf}")
+    with open(pdf, "rb") as f:
+        if f.read(5) != b"%PDF-":
+            sys.exit(f"{src} is not a PDF (vendor sites sometimes return an HTML page; download it manually)")
+    slug = slugify(a.slug or pdf.stem)
+    d = LIB / slug
+    if d.exists():
+        if not a.force:
+            sys.exit(f"'{slug}' already exists in {LIB} (use --force to re-ingest)")
+        shutil.rmtree(d)
+    pages = d / "pages"
+    pages.mkdir(parents=True)
+    shutil.copy2(pdf, d / "source.pdf")
+    if shutil.which("pdftotext") and shutil.which("pdfinfo"):
+        n = extract_with_pdftotext(pdf, pages)
+        if not (pages.parent / "toc.json").exists():
+            try:  # outline via pypdf is a bonus; ignore failures
+                tmpd = Path(tempfile.mkdtemp())
+                extract_with_pypdf(pdf, tmpd)
+                if (tmpd / "toc.json").exists():
+                    shutil.move(str(tmpd / "toc.json"), d / "toc.json")
+                shutil.rmtree(tmpd, ignore_errors=True)
+            except SystemExit:
+                pass
+    else:
+        n = extract_with_pypdf(pdf, pages)
+        if (pages / "toc.json").exists():
+            shutil.move(str(pages / "toc.json"), d / "toc.json")
+    empty = sum(1 for p in pages.glob("p*.txt") if len(p.read_text(errors="replace").strip()) < 20)
+    meta = {"slug": slug, "title": a.title or pdf.stem, "source": src, "pages": n,
+            "part": a.part, "kind": a.kind}
+    (d / "meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"added '{slug}': {n} pages -> {d}")
+    if n and empty / n > 0.3:
+        print(f"warning: {empty}/{n} pages have no text (scanned PDF?). OCR it first, e.g. `ocrmypdf in.pdf out.pdf`.")
+    if tmp:
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
+def docs(filter_slug=None):
+    if not LIB.exists():
+        return []
+    out = []
+    for d in sorted(LIB.iterdir()):
+        if (d / "meta.json").exists() and (not filter_slug or d.name == filter_slug or filter_slug in d.name):
+            out.append(d)
+    return out
+
+
+def cmd_list(a):
+    ds = docs()
+    if not ds:
+        print(f"library empty ({LIB}). Add one: datasheet add <pdf|url> --slug <name>")
+        return
+    for d in ds:
+        m = json.loads((d / "meta.json").read_text())
+        extra = " ".join(x for x in (m.get("kind"), m.get("part")) if x)
+        print(f"{m['slug']:<28} {m['pages']:>5}p  {m['title']}  {extra}")
+
+
+def cmd_search(a):
+    targets = docs(a.doc)
+    if not targets:
+        sys.exit("no matching documents (see `datasheet list`)")
+    flags = 0 if a.case_sensitive else re.I
+    pat = re.compile(a.pattern if a.regex else re.escape(a.pattern), flags)
+    hits = 0
+    for d in targets:
+        for pf in sorted((d / "pages").glob("p*.txt")):
+            lines = pf.read_text(errors="replace").splitlines()
+            idx = [i for i, l in enumerate(lines) if pat.search(l)]
+            if not idx:
+                continue
+            page = int(pf.stem[1:])
+            print(f"== {d.name} p.{page}")
+            shown = set()
+            for i in idx:
+                for j in range(max(0, i - a.context), min(len(lines), i + a.context + 1)):
+                    if j not in shown:
+                        print(f"  {j + 1:>4}{'>' if j == i else ':'} {lines[j].rstrip()}")
+                        shown.add(j)
+                hits += 1
+                if hits >= a.max:
+                    print(f"... stopped at {a.max} hits (narrow with --doc or a more specific pattern)")
+                    return
+    if not hits:
+        print("no matches")
+
+
+def cmd_page(a):
+    d = LIB / a.slug
+    if not d.exists():
+        sys.exit(f"no doc '{a.slug}'")
+    end = a.end or a.start
+    if end - a.start > 15:
+        sys.exit("read at most 16 pages at a time")
+    for p in range(a.start, end + 1):
+        f = d / "pages" / f"p{p:04d}.txt"
+        if f.exists():
+            print(f"===== {a.slug} p.{p} =====")
+            print(re.sub(r"[ \t]+\n", "\n", f.read_text(errors="replace")))
+
+
+def cmd_toc(a):
+    d = LIB / a.slug
+    f = d / "toc.json"
+    if not f.exists():
+        sys.exit("no outline for this doc; use `datasheet search` on section titles instead")
+    for e in json.loads(f.read_text()):
+        if a.filter and a.filter.lower() not in e["title"].lower():
+            continue
+        print(f"{'  ' * e['depth']}{e['title']}  ....  p.{e['page']}")
+
+
+def cmd_path(a):
+    print(LIB / a.slug / "source.pdf" if a.slug else LIB)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="datasheet", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("add"); s.add_argument("source"); s.add_argument("--slug"); s.add_argument("--title")
+    s.add_argument("--part", help="part number(s) this covers"); s.add_argument("--kind", choices=["datasheet", "reference-manual", "errata", "app-note", "schematic", "other"])
+    s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_add)
+    sub.add_parser("list").set_defaults(fn=cmd_list)
+    s = sub.add_parser("search"); s.add_argument("pattern"); s.add_argument("--doc"); s.add_argument("-C", "--context", type=int, default=1)
+    s.add_argument("-E", "--regex", action="store_true"); s.add_argument("-s", "--case-sensitive", action="store_true")
+    s.add_argument("--max", type=int, default=40); s.set_defaults(fn=cmd_search)
+    s = sub.add_parser("page"); s.add_argument("slug"); s.add_argument("start", type=int); s.add_argument("end", type=int, nargs="?"); s.set_defaults(fn=cmd_page)
+    s = sub.add_parser("toc"); s.add_argument("slug"); s.add_argument("filter", nargs="?"); s.set_defaults(fn=cmd_toc)
+    s = sub.add_parser("path"); s.add_argument("slug", nargs="?"); s.set_defaults(fn=cmd_path)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

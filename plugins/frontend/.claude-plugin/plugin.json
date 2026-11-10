@@ -1,0 +1,12 @@
+{
+  "name": "frontend",
+  "description": "Frontend and design setup: visual design review, accessibility (WCAG 2.2), Core Web Vitals performance, design systems and tokens, Figma-to-code, motion, and component architecture, plus browser (Playwright + Chrome DevTools), shadcn and Figma MCP servers.",
+  "author": { "name": "OlirEswar" },
+  "keywords": ["frontend", "design", "ui", "accessibility", "performance", "react", "tailwind"],
+  "dependencies": [
+    "frontend-design@claude-plugins-official",
+    "playwright@claude-plugins-official",
+    "context7@claude-plugins-official",
+    "typescript-lsp@claude-plugins-official"
+  ]
+}

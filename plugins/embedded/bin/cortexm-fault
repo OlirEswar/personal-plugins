@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""cortexm-fault - decode ARM Cortex-M fault status registers into plain English.
+
+  cortexm-fault --cfsr 0x00008200 --hfsr 0x40000000 --bfar 0x20030000
+  cortexm-fault --cfsr 0x00000400 --pc 0x08001234 --lr 0xFFFFFFFD --elf build/app.elf
+
+Grab the values in GDB:  x/4wx 0xE000ED28   (CFSR, HFSR, DFSR, MMFAR)  then  x/wx 0xE000ED38 (BFAR)
+and the stacked frame from the exception stack: x/8wx $sp  (r0 r1 r2 r3 r12 lr pc xpsr)
+With --elf, PC/LR are resolved to file:line via arm-none-eabi-addr2line.
+"""
+import argparse
+import shutil
+import subprocess
+
+CFSR_BITS = {
+    0: ("MMFSR.IACCVIOL", "Instruction access violation (executed from XN/protected region, bad function pointer, or MPU)"),
+    1: ("MMFSR.DACCVIOL", "Data access violation (MPU/protected region). MMFAR holds the address if MMARVALID"),
+    3: ("MMFSR.MUNSTKERR", "MemManage fault on exception return unstacking (corrupted stack/MPU on stack)"),
+    4: ("MMFSR.MSTKERR", "MemManage fault on exception entry stacking -> stack overflow into protected region likely"),
+    5: ("MMFSR.MLSPERR", "MemManage fault during lazy FP state preservation"),
+    7: ("MMFSR.MMARVALID", "MMFAR holds a valid fault address"),
+    8: ("BFSR.IBUSERR", "Instruction bus error (fetch from invalid memory; bad jump/return address)"),
+    9: ("BFSR.PRECISERR", "Precise data bus error - BFAR has the address; PC points at the faulting instruction"),
+    10: ("BFSR.IMPRECISERR", "Imprecise data bus error - a buffered write failed earlier than PC; disable write buffer (ACTLR.DISDEFWBUF) to make it precise"),
+    11: ("BFSR.UNSTKERR", "Bus fault on exception return unstacking (corrupted SP)"),
+    12: ("BFSR.STKERR", "Bus fault on exception entry stacking -> stack overflow / SP outside RAM"),
+    13: ("BFSR.LSPERR", "Bus fault during lazy FP state preservation"),
+    15: ("BFSR.BFARVALID", "BFAR holds a valid fault address"),
+    16: ("UFSR.UNDEFINSTR", "Undefined instruction (corrupt code, wrong -mcpu, jumped into data)"),
+    17: ("UFSR.INVSTATE", "Invalid state - Thumb bit clear in EPSR: function pointer without LSB set, or returning to a bad address"),
+    18: ("UFSR.INVPC", "Invalid PC load on exception return (bad EXC_RETURN / corrupted LR)"),
+    19: ("UFSR.NOCP", "Coprocessor access with coprocessor disabled - FPU used but CPACR not enabled (or compiled with hard-float before FPU init)"),
+    20: ("UFSR.STKOF", "Stack overflow detected by stack limit register (ARMv8-M)"),
+    24: ("UFSR.UNALIGNED", "Unaligned access with CCR.UNALIGN_TRP set (or LDM/STRD/LDRD on unaligned address)"),
+    25: ("UFSR.DIVBYZERO", "Divide by zero with CCR.DIV_0_TRP set"),
+}
+HFSR_BITS = {
+    1: ("VECTTBL", "Bus fault on vector table read (VTOR wrong or vector table not in valid memory)"),
+    30: ("FORCED", "Escalated configurable fault (MemManage/BusFault/UsageFault disabled or fault in handler) - see CFSR"),
+    31: ("DEBUGEVT", "Debug event (BKPT hit with no debugger attached?)"),
+}
+EXC_RETURN = {
+    0xFFFFFFF1: "return to Handler mode, MSP (nested exception)",
+    0xFFFFFFF9: "return to Thread mode, MSP",
+    0xFFFFFFFD: "return to Thread mode, PSP (RTOS task) - stacked frame is on PSP",
+    0xFFFFFFE1: "Handler mode, MSP, FP frame",
+    0xFFFFFFE9: "Thread mode, MSP, FP frame",
+    0xFFFFFFED: "Thread mode, PSP, FP frame (RTOS task with FPU context)",
+}
+
+
+def h(x):
+    return int(x, 0) if x is not None else None
+
+
+def addr2line(elf, addr):
+    tool = shutil.which("arm-none-eabi-addr2line") or shutil.which("llvm-addr2line") or shutil.which("addr2line")
+    if not tool:
+        return "(no addr2line found)"
+    out = subprocess.run([tool, "-e", elf, "-f", "-C", "-i", "-p", hex(addr & ~1)], capture_output=True, text=True)
+    return out.stdout.strip() or out.stderr.strip()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    for r in ("cfsr", "hfsr", "mmfar", "bfar", "pc", "lr", "afsr"):
+        ap.add_argument(f"--{r}")
+    ap.add_argument("--elf")
+    a = ap.parse_args()
+    cfsr, hfsr, mmfar, bfar, pc, lr = map(h, (a.cfsr, a.hfsr, a.mmfar, a.bfar, a.pc, a.lr))
+
+    if hfsr is not None:
+        print(f"HFSR = 0x{hfsr:08X}")
+        for bit, (n, d) in HFSR_BITS.items():
+            if hfsr >> bit & 1:
+                print(f"  {n}: {d}")
+    if cfsr is not None:
+        print(f"CFSR = 0x{cfsr:08X}")
+        if cfsr == 0:
+            print("  (no configurable fault flags set)")
+        for bit, (n, d) in CFSR_BITS.items():
+            if cfsr >> bit & 1:
+                print(f"  {n}: {d}")
+        if cfsr >> 7 & 1 and mmfar is not None:
+            print(f"  -> MemManage fault address MMFAR = 0x{mmfar:08X}")
+        if cfsr >> 15 & 1 and bfar is not None:
+            print(f"  -> Bus fault address BFAR = 0x{bfar:08X}")
+        if (cfsr >> 4 & 1) or (cfsr >> 12 & 1):
+            print("  hint: stacking error => check stack size / overflow (fill pattern, -fstack-usage, RTOS high-water mark)")
+    if lr is not None:
+        print(f"LR = 0x{lr:08X}: {EXC_RETURN.get(lr, 'not an EXC_RETURN value (this is a stacked LR)')}")
+    if a.elf:
+        for label, v in (("PC", pc), ("LR", lr)):
+            if v is not None and v < 0xF0000000:
+                print(f"{label} 0x{v:08X} -> {addr2line(a.elf, v)}")
+    if cfsr is None and hfsr is None:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()

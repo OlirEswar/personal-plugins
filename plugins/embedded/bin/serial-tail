@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""serial-tail - non-interactive serial capture for agents (stdlib only, macOS/Linux).
+
+Interactive monitors (screen, minicom, idf.py monitor) hang an agent. This reads a
+serial port for a bounded time, optionally sends a line, and exits.
+
+  serial-tail --list
+  serial-tail /dev/cu.usbmodem1101 -b 115200 -t 5
+  serial-tail /dev/ttyUSB0 -t 10 --until "READY" --send "help\\r\\n" --reset
+  serial-tail /dev/ttyACM0 -t 30 --log boot.log --timestamps
+"""
+import argparse
+import fcntl
+import glob
+import os
+import platform
+import re
+import select
+import struct
+import sys
+import termios
+import time
+
+
+def list_ports():
+    pats = ["/dev/cu.*"] if platform.system() == "Darwin" else [
+        "/dev/ttyUSB*", "/dev/ttyACM*", "/dev/ttyAMA*", "/dev/serial/by-id/*"]
+    ports = sorted(p for pat in pats for p in glob.glob(pat)
+                   if "Bluetooth" not in p and "debug-console" not in p)
+    print("\n".join(ports) if ports else "no serial ports found")
+
+
+def configure(fd, baud):
+    attrs = termios.tcgetattr(fd)
+    iflag, oflag, cflag, lflag, _, _, cc = attrs
+    iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP |
+               termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON | termios.IXOFF)
+    oflag &= ~termios.OPOST
+    lflag &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+    cflag &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB)
+    cflag |= termios.CS8 | termios.CREAD | termios.CLOCAL
+    if hasattr(termios, "CRTSCTS"):
+        cflag &= ~termios.CRTSCTS
+    cc[termios.VMIN] = 0
+    cc[termios.VTIME] = 0
+    const = getattr(termios, f"B{baud}", None)
+    speed = const if const is not None else termios.B9600
+    termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, speed, speed, cc])
+    if const is None:
+        if platform.system() == "Darwin":  # IOSSIOSPEED for non-standard rates
+            fcntl.ioctl(fd, 0x80085402, struct.pack("L", baud))
+        else:
+            sys.exit(f"baud {baud} not supported by termios here; use a standard rate")
+
+
+def pulse_reset(fd):
+    """Toggle DTR/RTS like esptool/Arduino auto-reset (EN low via RTS)."""
+    TIOCMBIS, TIOCMBIC = (0x8004746C, 0x8004746B) if platform.system() == "Darwin" else (0x5416, 0x5417)
+    DTR, RTS = 0x002, 0x004
+    fcntl.ioctl(fd, TIOCMBIC, struct.pack("I", DTR))
+    fcntl.ioctl(fd, TIOCMBIS, struct.pack("I", RTS))
+    time.sleep(0.1)
+    fcntl.ioctl(fd, TIOCMBIC, struct.pack("I", RTS))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("port", nargs="?")
+    ap.add_argument("-b", "--baud", type=int, default=115200)
+    ap.add_argument("-t", "--timeout", type=float, default=5.0, help="max seconds to capture (default 5)")
+    ap.add_argument("--until", help="regex; stop as soon as output matches")
+    ap.add_argument("--send", help="string to send after opening (escapes like \\r\\n allowed)")
+    ap.add_argument("--send-delay", type=float, default=0.3)
+    ap.add_argument("--reset", action="store_true", help="pulse RTS/DTR to reset the board first")
+    ap.add_argument("--log", help="also append output to this file")
+    ap.add_argument("--timestamps", action="store_true", help="prefix lines with seconds since start")
+    ap.add_argument("--max-bytes", type=int, default=200_000, help="stop after this much output")
+    ap.add_argument("--list", action="store_true")
+    a = ap.parse_args()
+
+    if a.list or not a.port:
+        list_ports()
+        return
+    try:
+        fd = os.open(a.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError as e:
+        sys.exit(f"cannot open {a.port}: {e} (in use by another monitor? wrong port? try --list)")
+    configure(fd, a.baud)
+    termios.tcflush(fd, termios.TCIFLUSH)
+    if a.reset:
+        pulse_reset(fd)
+
+    pat = re.compile(a.until) if a.until else None
+    logf = open(a.log, "a") if a.log else None
+    start = time.monotonic()
+    sent = a.send is None
+    buf, total, at_line_start = "", 0, True
+    matched = False
+    try:
+        while time.monotonic() - start < a.timeout and total < a.max_bytes:
+            if not sent and time.monotonic() - start >= a.send_delay:
+                os.write(fd, a.send.encode().decode("unicode_escape").encode("latin-1"))
+                sent = True
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if not r:
+                continue
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            if not data:
+                continue
+            total += len(data)
+            text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            if a.timestamps:
+                out = []
+                for ch in text:
+                    if at_line_start:
+                        out.append(f"[{time.monotonic() - start:7.3f}] ")
+                    out.append(ch)
+                    at_line_start = ch == "\n"
+                text = "".join(out)
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            if logf:
+                logf.write(text)
+            if pat:
+                buf = (buf + text)[-8192:]
+                if pat.search(buf):
+                    matched = True
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.close(fd)
+        if logf:
+            logf.close()
+    elapsed = time.monotonic() - start
+    why = "matched --until" if matched else ("max bytes" if total >= a.max_bytes else "timeout")
+    print(f"\n--- serial-tail: {total} bytes in {elapsed:.1f}s ({why}) ---", file=sys.stderr)
+    if pat and not matched:
+        sys.exit(3)
+
+
+if __name__ == "__main__":
+    main()

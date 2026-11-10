@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""setups - manage per-project Claude Code setups from the personal-plugins marketplace.
+
+A "setup" is a plugin in this marketplace (e.g. frontend, embedded). This tool:
+  * installs/removes setups in the current project            (use / drop)
+  * shows project-local customizations vs. the setups         (status)
+  * copies a setup component into the project to tweak it     (eject)
+  * pushes project tweaks back into the marketplace repo      (promote)
+  * scaffolds a brand new setup                               (new)
+  * commits/pushes/pulls the repo and refreshes Claude caches (sync)
+
+Run `setups <command> -h` for details. Stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import filecmp
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+MARKETPLACE = "personal-plugins"
+KINDS = ("skill", "agent", "command", "mcp", "hook")
+SECRET_RE = re.compile(r"(key|token|secret|password|passwd|auth|bearer|credential)", re.I)
+INTERNAL = {"setups"}  # plugins that are not "setups" a project would install
+
+
+# --------------------------------------------------------------------------- utils
+def die(msg: str, code: int = 1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg: str):
+    print(msg)
+
+
+def load_json(path: Path, default=None):
+    if not path.exists():
+        return {} if default is None else default
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        die(f"{path} is not valid JSON: {e}")
+
+
+def save_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def run(cmd: list[str], cwd: Path | None = None, check=True, capture=False):
+    res = subprocess.run(cmd, cwd=cwd, text=True,
+                         capture_output=capture)
+    if check and res.returncode != 0:
+        if capture:
+            sys.stderr.write(res.stdout + res.stderr)
+        die(f"command failed ({res.returncode}): {' '.join(cmd)}")
+    return res
+
+
+def is_repo_root(p: Path) -> bool:
+    mp = p / ".claude-plugin" / "marketplace.json"
+    if not mp.exists():
+        return False
+    try:
+        return json.loads(mp.read_text()).get("name") == MARKETPLACE
+    except Exception:
+        return False
+
+
+def find_repo() -> Path:
+    """Locate the editable checkout of the marketplace repo."""
+    env = os.environ.get("PERSONAL_PLUGINS_DIR")
+    if env:
+        p = Path(env).expanduser().resolve()
+        if is_repo_root(p):
+            return p
+        die(f"PERSONAL_PLUGINS_DIR={env} is not the {MARKETPLACE} repo")
+    # A marketplace added from a local directory is the editable source of truth.
+    known = load_json(Path.home() / ".claude/plugins/known_marketplaces.json")
+    src = (known.get(MARKETPLACE) or {}).get("source") or {}
+    for key in ("path", "directory"):
+        if src.get(key) and is_repo_root(Path(src[key]).expanduser()):
+            return Path(src[key]).expanduser().resolve()
+    # Running from inside the repo (plugin loaded in place, or invoked directly).
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if is_repo_root(parent) and (parent / ".git").exists() and "/.claude/plugins/" not in str(parent):
+            return parent
+    # Conventional location.
+    for guess in (Path.home() / "Projects/personal_plugins", Path.home() / "Projects/personal-plugins"):
+        if is_repo_root(guess):
+            return guess.resolve()
+    die("cannot find the personal-plugins repo checkout. Clone it and set PERSONAL_PLUGINS_DIR=/path/to/it")
+
+
+def project_dir(arg: str | None) -> Path:
+    p = Path(arg or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()).resolve()
+    if is_repo_root(p):
+        die("you are inside the marketplace repo itself; run this from a project (or pass --project)")
+    return p
+
+
+def setups_in(repo: Path) -> dict[str, dict]:
+    mp = load_json(repo / ".claude-plugin/marketplace.json")
+    return {e["name"]: e for e in mp.get("plugins", [])}
+
+
+def plugin_dir(repo: Path, name: str) -> Path:
+    entry = setups_in(repo).get(name)
+    if not entry:
+        die(f"no setup named '{name}'. Known: {', '.join(setups_in(repo))}")
+    src = entry["source"]
+    if not isinstance(src, str):
+        die(f"setup '{name}' is not a local plugin in this repo")
+    return (repo / src).resolve()
+
+
+def claude_cli() -> str:
+    exe = shutil.which("claude")
+    if not exe:
+        die("the `claude` CLI is not on PATH")
+    return exe
+
+
+def marketplace_known() -> bool:
+    known = load_json(Path.home() / ".claude/plugins/known_marketplaces.json")
+    return MARKETPLACE in known
+
+
+def ensure_marketplace(repo: Path):
+    if not marketplace_known():
+        info(f"Registering marketplace from {repo} ...")
+        run([claude_cli(), "plugin", "marketplace", "add", str(repo)])
+
+
+# ------------------------------------------------------------- project components
+def project_components(proj: Path) -> dict[str, dict[str, Path | dict]]:
+    """Everything customizable that lives in the project (not in a plugin)."""
+    out: dict[str, dict] = {k: {} for k in KINDS}
+    cl = proj / ".claude"
+    for d in sorted((cl / "skills").glob("*/SKILL.md")):
+        out["skill"][d.parent.name] = d.parent
+    for f in sorted((cl / "agents").glob("*.md")):
+        out["agent"][f.stem] = f
+    for f in sorted((cl / "commands").glob("*.md")):
+        out["command"][f.stem] = f
+    for name, cfg in project_mcp_servers(proj).items():
+        out["mcp"][name] = cfg
+    hooks = load_json(cl / "settings.json").get("hooks", {})
+    for event, entries in hooks.items():
+        out["hook"][event] = entries
+    return out
+
+
+def project_mcp_servers(proj: Path) -> dict:
+    servers = dict(load_json(proj / ".mcp.json").get("mcpServers", {}))
+    # `claude mcp add` with local scope stores servers in ~/.claude.json per project
+    user_cfg = load_json(Path.home() / ".claude.json")
+    local = ((user_cfg.get("projects") or {}).get(str(proj)) or {}).get("mcpServers") or {}
+    for k, v in local.items():
+        servers.setdefault(k, v)
+    return servers
+
+
+def plugin_components(pdir: Path) -> dict[str, dict]:
+    out: dict[str, dict] = {k: {} for k in KINDS}
+    for d in sorted((pdir / "skills").glob("*/SKILL.md")):
+        out["skill"][d.parent.name] = d.parent
+    for f in sorted((pdir / "agents").glob("*.md")):
+        out["agent"][f.stem] = f
+    for f in sorted((pdir / "commands").glob("*.md")):
+        out["command"][f.stem] = f
+    out["mcp"] = load_json(pdir / ".mcp.json").get("mcpServers", {})
+    out["hook"] = load_json(pdir / "hooks/hooks.json").get("hooks", {})
+    return out
+
+
+def same(a, b) -> bool:
+    if isinstance(a, Path) and isinstance(b, Path):
+        if a.is_dir() and b.is_dir():
+            cmp = filecmp.dircmp(a, b)
+            def clean(c):
+                if c.left_only or c.right_only or c.diff_files or c.funny_files:
+                    return False
+                return all(clean(s) for s in c.subdirs.values())
+            return clean(cmp)
+        if a.is_file() and b.is_file():
+            return filecmp.cmp(a, b, shallow=False)
+        return False
+    return a == b
+
+
+def enabled_setups(proj: Path) -> dict[str, str]:
+    """setup name -> scope where it is enabled for this project."""
+    res = {}
+    for scope, f in (("project", proj / ".claude/settings.json"),
+                     ("local", proj / ".claude/settings.local.json")):
+        for key, on in (load_json(f).get("enabledPlugins") or {}).items():
+            name, _, mkt = key.partition("@")
+            if mkt == MARKETPLACE and on:
+                res[name] = scope
+    for key, on in (load_json(Path.home() / ".claude/settings.json").get("enabledPlugins") or {}).items():
+        name, _, mkt = key.partition("@")
+        if mkt == MARKETPLACE and on:
+            res.setdefault(name, "user")
+    return res
+
+
+def parse_item(s: str) -> tuple[str, str]:
+    kind, sep, name = s.partition(":")
+    if not sep:
+        kind, sep, name = s.partition("/")
+    kind = kind.rstrip("s")
+    if kind not in KINDS or not name:
+        die(f"bad item '{s}'. Use kind:name with kind in {', '.join(KINDS)} (e.g. skill:my-skill, mcp:github, hook:PostToolUse)")
+    return kind, name
+
+
+# ----------------------------------------------------------------------- commands
+def cmd_where(a):
+    print(find_repo())
+
+
+def cmd_list(a):
+    repo = find_repo()
+    proj = Path(a.project or os.getcwd()).resolve()
+    enabled = {} if is_repo_root(proj) else enabled_setups(proj)
+    info(f"Marketplace: {repo}\n")
+    for name, e in setups_in(repo).items():
+        mark = f"[enabled: {enabled[name]}]" if name in enabled else ""
+        tag = " (manager)" if name in INTERNAL else ""
+        info(f"  {name}{tag} {mark}\n      {e.get('description', '')}")
+
+
+def cmd_use(a):
+    repo = find_repo()
+    proj = project_dir(a.project)
+    ensure_marketplace(repo)
+    known = setups_in(repo)
+    for name in a.names:
+        if name not in known:
+            die(f"unknown setup '{name}'. Known: {', '.join(known)}")
+        info(f"Installing {name}@{MARKETPLACE} (scope: {a.scope}) in {proj} ...")
+        run([claude_cli(), "plugin", "install", f"{name}@{MARKETPLACE}", "--scope", a.scope], cwd=proj)
+    info("\nDone. Restart Claude Code or run /reload-plugins in that project to load it.")
+    for name in a.names:
+        readme = plugin_dir(repo, name) / "README.md"
+        if readme.exists():
+            m = re.search(r"## Prerequisites\n(.*?)(\n## |\Z)", readme.read_text(), re.S)
+            if m:
+                info(f"\n{name} prerequisites:\n{m.group(1).strip()}")
+
+
+def cmd_drop(a):
+    proj = project_dir(a.project)
+    for name in a.names:
+        run([claude_cli(), "plugin", "uninstall", f"{name}@{MARKETPLACE}", "--scope", a.scope], cwd=proj, check=False)
+
+
+def cmd_status(a):
+    repo = find_repo()
+    proj = project_dir(a.project)
+    enabled = enabled_setups(proj)
+    info(f"Project: {proj}")
+    info(f"Enabled setups: {', '.join(f'{k} ({v})' for k, v in enabled.items()) or 'none'}\n")
+    local = project_components(proj)
+    all_setups = {n: plugin_components(plugin_dir(repo, n)) for n in setups_in(repo) if n not in INTERNAL}
+    rows = []
+    for kind in KINDS:
+        for name, val in local[kind].items():
+            owners = [s for s, comps in all_setups.items() if name in comps[kind]]
+            if not owners:
+                state = "new (only in this project)"
+            else:
+                diffs = [s for s in owners if not same(val, all_setups[s][kind][name])]
+                state = (f"modified vs {', '.join(diffs)}" if diffs
+                         else f"identical to {', '.join(owners)} (safe to delete locally)")
+            rows.append((f"{kind}:{name}", state))
+    if not rows:
+        info("No project-local skills/agents/commands/MCP servers/hooks. Nothing to promote.")
+        return
+    w = max(len(r[0]) for r in rows)
+    info("Project-local components:")
+    for item, state in rows:
+        info(f"  {item.ljust(w)}  {state}")
+    info("\nPromote with: setups promote <setup> <kind:name> ...   (or --all)")
+
+
+def cmd_diff(a):
+    repo = find_repo()
+    proj = project_dir(a.project)
+    pdir = plugin_dir(repo, a.setup)
+    kind, name = parse_item(a.item)
+    local = project_components(proj)[kind].get(name)
+    plug = plugin_components(pdir)[kind].get(name)
+    if local is None:
+        die(f"{kind}:{name} is not in the project")
+    if plug is None:
+        info(f"{kind}:{name} is new (not in {a.setup})")
+        return
+
+    def text_of(v, base: Path | None):
+        if isinstance(v, Path):
+            files = sorted(p for p in v.rglob("*") if p.is_file()) if v.is_dir() else [v]
+            out = []
+            for f in files:
+                rel = f.relative_to(v) if v.is_dir() else f.name
+                try:
+                    out += [f"### {rel}\n"] + f.read_text().splitlines(keepends=True)
+                except UnicodeDecodeError:
+                    out.append(f"### {rel} (binary)\n")
+            return out
+        return json.dumps(v, indent=2).splitlines(keepends=True)
+
+    sys.stdout.writelines(difflib.unified_diff(text_of(plug, pdir), text_of(local, proj),
+                                               f"{a.setup}/{kind}:{name}", f"project/{kind}:{name}"))
+
+
+def copy_path(src: Path, dst: Path):
+    if dst.exists():
+        shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def secretish(cfg: dict) -> list[str]:
+    hits = []
+    for section in ("env", "headers"):
+        for k, v in (cfg.get(section) or {}).items():
+            if SECRET_RE.search(k) and isinstance(v, str) and not re.fullmatch(r"\$\{[^}]+\}", v.strip()):
+                hits.append(f"{section}.{k}")
+    return hits
+
+
+HOOK_PATH_RE = re.compile(r'"?\$\{?CLAUDE_PROJECT_DIR\}?"?/\.claude/hooks/([\w.\-/]+)|(?<![\w/])\.claude/hooks/([\w.\-/]+)')
+
+
+def promote_hooks(event: str, entries: list, proj: Path, pdir: Path, dry: bool) -> list[str]:
+    copied = []
+
+    def rewrite(cmd: str) -> str:
+        def repl(m):
+            rel = m.group(1) or m.group(2)
+            src = proj / ".claude/hooks" / rel
+            if src.exists():
+                copied.append(rel)
+                if not dry:
+                    copy_path(src, pdir / "hooks" / rel)
+            return '"${CLAUDE_PLUGIN_ROOT}"/hooks/' + rel
+        return HOOK_PATH_RE.sub(repl, cmd)
+
+    new_entries = json.loads(json.dumps(entries))
+    for entry in new_entries:
+        for h in entry.get("hooks", []):
+            if isinstance(h.get("command"), str):
+                h["command"] = rewrite(h["command"])
+    hooks_file = pdir / "hooks/hooks.json"
+    data = load_json(hooks_file) or {"hooks": {}}
+    existing = data.setdefault("hooks", {}).setdefault(event, [])
+    for e in new_entries:
+        if e not in existing:
+            existing.append(e)
+    if not dry:
+        save_json(hooks_file, data)
+    return copied
+
+
+def remove_local(kind: str, name: str, proj: Path):
+    cl = proj / ".claude"
+    if kind == "skill":
+        shutil.rmtree(cl / "skills" / name)
+    elif kind in ("agent", "command"):
+        (cl / f"{kind}s" / f"{name}.md").unlink()
+    elif kind == "mcp":
+        f = proj / ".mcp.json"
+        d = load_json(f)
+        if name in d.get("mcpServers", {}):
+            del d["mcpServers"][name]
+            save_json(f, d)
+        else:
+            info(f"  note: mcp:{name} lives in ~/.claude.json; remove with `claude mcp remove {name} -s local`")
+    elif kind == "hook":
+        f = cl / "settings.json"
+        d = load_json(f)
+        d.get("hooks", {}).pop(name, None)
+        if not d.get("hooks"):
+            d.pop("hooks", None)
+        save_json(f, d)
+
+
+def git(repo: Path, *args, check=True, capture=False):
+    return run(["git", *args], cwd=repo, check=check, capture=capture)
+
+
+def commit(repo: Path, paths: list[Path], message: str, push: bool):
+    if not (repo / ".git").exists():
+        info("(repo is not a git checkout; skipping commit)")
+        return
+    git(repo, "add", "--", *[str(p) for p in paths])
+    if git(repo, "diff", "--cached", "--quiet", check=False).returncode == 0:
+        info("No changes to commit.")
+    else:
+        git(repo, "commit", "-q", "-m", message)
+        info(f"Committed: {message}")
+    if push:
+        do_push(repo)
+
+
+def do_push(repo: Path):
+    if not git(repo, "remote", check=False, capture=True).stdout.strip():
+        info("(no git remote configured; skipping push)")
+        return
+    git(repo, "pull", "--rebase", "--autostash", "-q", check=False)
+    git(repo, "push", "-q")
+    info("Pushed to remote.")
+
+
+def cmd_promote(a):
+    repo = find_repo()
+    proj = project_dir(a.project)
+    pdir = plugin_dir(repo, a.setup)
+    local = project_components(proj)
+    plug = plugin_components(pdir)
+
+    if a.all:
+        items = [(k, n) for k in KINDS for n in local[k]
+                 if not (n in plug[k] and same(local[k][n], plug[k][n]))]
+    else:
+        items = [parse_item(i) for i in a.items]
+    if not items:
+        die("nothing to promote (pass kind:name items or --all; see `setups status`)")
+
+    done = []
+    for kind, name in items:
+        val = local[kind].get(name)
+        if val is None:
+            die(f"{kind}:{name} not found in project {proj}")
+        action = "update" if name in plug[kind] else "add"
+        if kind == "skill":
+            dst = pdir / "skills" / name
+            if not a.dry_run:
+                copy_path(val, dst)
+        elif kind in ("agent", "command"):
+            dst = pdir / f"{kind}s" / f"{name}.md"
+            if not a.dry_run:
+                copy_path(val, dst)
+        elif kind == "mcp":
+            hits = secretish(val)
+            if hits and not a.allow_secrets:
+                die(f"mcp:{name} has literal secret-looking values ({', '.join(hits)}). "
+                    "Replace them with ${ENV_VAR} references (or plugin userConfig) before promoting, "
+                    "or pass --allow-secrets if you are sure.")
+            f = pdir / ".mcp.json"
+            data = load_json(f) or {"mcpServers": {}}
+            data.setdefault("mcpServers", {})[name] = val
+            if not a.dry_run:
+                save_json(f, data)
+        elif kind == "hook":
+            copied = promote_hooks(name, val, proj, pdir, a.dry_run)
+            if copied:
+                info(f"  hook scripts copied: {', '.join(copied)}")
+        info(f"{'[dry-run] ' if a.dry_run else ''}{action} {kind}:{name} -> {a.setup}")
+        done.append((kind, name))
+
+    if a.dry_run:
+        return
+    if a.move:
+        for kind, name in done:
+            remove_local(kind, name, proj)
+        info("Removed promoted items from the project (the setup now provides them).")
+    msg = a.message or f"{a.setup}: promote {', '.join(f'{k}:{n}' for k, n in done)} from {proj.name}"
+    commit(repo, [pdir], msg, a.push)
+    info("\nOther projects using this setup pick it up on their next session start (or /reload-plugins)"
+         + ("" if marketplace_is_local() else ", after `setups sync --pull`") + ".")
+
+
+def marketplace_is_local() -> bool:
+    src = (load_json(Path.home() / ".claude/plugins/known_marketplaces.json").get(MARKETPLACE) or {}).get("source") or {}
+    return src.get("source") in ("directory", "file") or bool(src.get("path"))
+
+
+def cmd_eject(a):
+    repo = find_repo()
+    proj = project_dir(a.project)
+    pdir = plugin_dir(repo, a.setup)
+    kind, name = parse_item(a.item)
+    if kind not in ("skill", "agent", "command"):
+        die("only skill/agent/command can be ejected (edit MCP servers and hooks with promote)")
+    plug = plugin_components(pdir)[kind].get(name)
+    if plug is None:
+        die(f"{a.setup} has no {kind} named '{name}'")
+    dst = proj / ".claude" / f"{kind}s" / (name if kind == "skill" else f"{name}.md")
+    if dst.exists() and not a.force:
+        die(f"{dst} already exists (use --force to overwrite)")
+    copy_path(plug, dst)
+    info(f"Ejected {a.setup}:{name} -> {dst}")
+    info("Tweak it there and test it in this project. Note: the plugin copy is still loaded too, as "
+         f"/{a.setup}:{name}; the local copy is /{name}.")
+    info(f"When happy: setups promote {a.setup} {kind}:{name} --move")
+
+
+def cmd_new(a):
+    repo = find_repo()
+    name = a.name
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        die("setup names must be kebab-case")
+    if name in setups_in(repo):
+        die(f"setup '{name}' already exists")
+    pdir = repo / "plugins" / name
+    (pdir / ".claude-plugin").mkdir(parents=True)
+    (pdir / "skills").mkdir()
+    (pdir / "agents").mkdir()
+    manifest = {"name": name, "description": a.description, "author": {"name": "OlirEswar"}}
+    if a.depends:
+        manifest["dependencies"] = a.depends
+    save_json(pdir / ".claude-plugin/plugin.json", manifest)
+    (pdir / "README.md").write_text(
+        f"# {name}\n\n{a.description}\n\n## Prerequisites\n\n- (none yet)\n\n## Contents\n\n"
+        "| Kind | Name | Purpose |\n|---|---|---|\n")
+    mp_file = repo / ".claude-plugin/marketplace.json"
+    mp = load_json(mp_file)
+    mp["plugins"].append({"name": name, "description": a.description,
+                          "source": f"./plugins/{name}", "category": "development"})
+    save_json(mp_file, mp)
+    info(f"Created setup '{name}' at {pdir}")
+    paths = [pdir, mp_file]
+    if a.from_project:
+        proj = project_dir(a.project)
+        ns = argparse.Namespace(project=str(proj), setup=name, items=[], all=True, move=False,
+                                dry_run=False, allow_secrets=False, push=False,
+                                message=f"{name}: snapshot from {proj.name}")
+        commit(repo, paths, f"Add setup '{name}'", False)
+        cmd_promote(ns)
+        if a.push:
+            do_push(repo)
+    else:
+        commit(repo, paths, f"Add setup '{name}'", a.push)
+    if marketplace_known():
+        run([claude_cli(), "plugin", "marketplace", "update", MARKETPLACE], check=False, capture=True)
+
+
+def cmd_sync(a):
+    repo = find_repo()
+    if a.pull or not a.push:
+        if git(repo, "remote", check=False, capture=True).stdout.strip():
+            git(repo, "pull", "--rebase", "--autostash", "-q")
+            info("Pulled latest from remote.")
+    if a.push or not a.pull:
+        if git(repo, "status", "--porcelain", capture=True).stdout.strip():
+            commit(repo, [repo], a.message or "Update setups", False)
+        do_push(repo)
+    if marketplace_known():
+        run([claude_cli(), "plugin", "marketplace", "update", MARKETPLACE], check=False, capture=True)
+        if not marketplace_is_local():
+            proj = Path(a.project or os.getcwd()).resolve()
+            for name, scope in enabled_setups(proj).items():
+                run([claude_cli(), "plugin", "update", f"{name}@{MARKETPLACE}", "--scope", scope],
+                    cwd=proj, check=False)
+        info("Claude plugin caches refreshed. Restart or /reload-plugins to apply.")
+
+
+def cmd_validate(a):
+    repo = find_repo()
+    ok = True
+    targets = [repo] + [plugin_dir(repo, n) for n in setups_in(repo)]
+    for t in targets:
+        res = run([claude_cli(), "plugin", "validate", str(t)], check=False, capture=True)
+        status = "ok" if res.returncode == 0 else "FAIL"
+        ok &= res.returncode == 0
+        info(f"[{status}] {t.relative_to(repo) if t != repo else 'marketplace'}")
+        if res.returncode != 0 or a.verbose:
+            info((res.stdout + res.stderr).strip())
+    sys.exit(0 if ok else 1)
+
+
+# --------------------------------------------------------------------------- main
+def main():
+    p = argparse.ArgumentParser(prog="setups", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--project", help="project directory (default: $CLAUDE_PROJECT_DIR or cwd)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("where", help="print the marketplace repo path").set_defaults(fn=cmd_where)
+    sub.add_parser("list", help="list setups and which are enabled here").set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("use", help="install setup(s) into the current project")
+    s.add_argument("names", nargs="+")
+    s.add_argument("--scope", choices=["project", "local", "user"], default="project",
+                   help="project = .claude/settings.json (committed), local = settings.local.json (just you)")
+    s.set_defaults(fn=cmd_use)
+
+    s = sub.add_parser("drop", help="uninstall setup(s) from the current project")
+    s.add_argument("names", nargs="+")
+    s.add_argument("--scope", choices=["project", "local", "user"], default="project")
+    s.set_defaults(fn=cmd_drop)
+
+    sub.add_parser("status", help="show project-local components vs. setups").set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("diff", help="diff a project component against a setup's copy")
+    s.add_argument("setup")
+    s.add_argument("item", help="kind:name")
+    s.set_defaults(fn=cmd_diff)
+
+    s = sub.add_parser("eject", help="copy a setup's skill/agent/command into the project to tweak")
+    s.add_argument("setup")
+    s.add_argument("item", help="kind:name, e.g. skill:datasheets")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_eject)
+
+    s = sub.add_parser("promote", help="copy project components into a setup and commit")
+    s.add_argument("setup")
+    s.add_argument("items", nargs="*", help="kind:name (skill:x agent:y command:z mcp:server hook:Event)")
+    s.add_argument("--all", action="store_true", help="promote every new/modified project component")
+    s.add_argument("--move", action="store_true", help="remove the project-local copies afterwards")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--allow-secrets", action="store_true")
+    s.add_argument("-m", "--message")
+    s.add_argument("--push", action="store_true", help="git push after committing")
+    s.set_defaults(fn=cmd_promote)
+
+    s = sub.add_parser("new", help="scaffold a new setup plugin")
+    s.add_argument("name")
+    s.add_argument("-d", "--description", required=True)
+    s.add_argument("--depends", nargs="*", default=[], help="e.g. pyright-lsp@claude-plugins-official")
+    s.add_argument("--from-project", action="store_true", help="seed it with this project's components")
+    s.add_argument("--push", action="store_true")
+    s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("sync", help="pull/commit/push the repo and refresh Claude's caches")
+    s.add_argument("--pull", action="store_true", help="only pull")
+    s.add_argument("--push", action="store_true", help="only commit+push")
+    s.add_argument("-m", "--message")
+    s.set_defaults(fn=cmd_sync)
+
+    s = sub.add_parser("validate", help="run `claude plugin validate` on the marketplace and every setup")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(fn=cmd_validate)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

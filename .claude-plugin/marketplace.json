@@ -1,0 +1,29 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "personal-plugins",
+  "description": "Personal Claude Code setups: swap a whole toolkit (skills, agents, MCP servers, hooks) per project.",
+  "owner": {
+    "name": "OlirEswar"
+  },
+  "allowCrossMarketplaceDependenciesOn": ["claude-plugins-official"],
+  "plugins": [
+    {
+      "name": "setups",
+      "description": "Setup manager: install a setup into a project, eject pieces to tweak, and promote project tweaks back into this marketplace.",
+      "source": "./plugins/setups",
+      "category": "productivity"
+    },
+    {
+      "name": "frontend",
+      "description": "Frontend/design setup: design review, accessibility, performance, design systems, Figma-to-code, browser + shadcn + Figma MCP servers.",
+      "source": "./plugins/frontend",
+      "category": "development"
+    },
+    {
+      "name": "embedded",
+      "description": "Embedded/firmware setup: datasheet library, SVD register lookup, build/flash/serial tooling, fault decoding, firmware review.",
+      "source": "./plugins/embedded",
+      "category": "development"
+    }
+  ]
+}

@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""svd - look up peripherals/registers/bitfields from a CMSIS-SVD file (stdlib only).
+
+Use the vendor SVD as ground truth instead of recalling register addresses from memory.
+
+  svd find                                  # locate *.svd files in the project / common SDK paths
+  svd peripherals STM32F407.svd [filter]
+  svd show STM32F407.svd RCC                # all registers of a peripheral (address, reset value)
+  svd show STM32F407.svd RCC.PLLCFGR        # one register with every field and its bit range
+  svd search STM32F407.svd PLLM             # find registers/fields by name or description
+  svd decode STM32F407.svd RCC.CFGR 0x0000940A   # decode a raw register value field by field
+  svd addr STM32F407.svd 0x40023804         # which register lives at this address?
+
+Fetch SVDs from the vendor pack (CMSIS-Pack .pack is a zip), cmsis-svd-data, or the SDK
+(e.g. STM32CubeIDE, ESP-IDF `components/soc/<chip>/`, Nordic MDK, Pico SDK `src/rp2040/hardware_regs/`).
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def num(s, default=None):
+    if s is None:
+        return default
+    s = s.strip().lower().replace("_", "")
+    if s.startswith("#"):
+        return int(s[1:].replace("x", "0"), 2)
+    if s.startswith("0b"):
+        return int(s[2:], 2)
+    return int(s, 0)
+
+
+def txt(e, tag, default=None):
+    c = e.find(tag)
+    return c.text.strip() if c is not None and c.text else default
+
+
+class Dev:
+    def __init__(self, path):
+        self.root = ET.parse(path).getroot()
+        self.size = num(txt(self.root, "size"), 32)
+        self.reset = num(txt(self.root, "resetValue"), 0)
+        self.access = txt(self.root, "access", "read-write")
+        self.periph = {}
+        raw = {p.findtext("name"): p for p in self.root.iter("peripheral")}
+        for name, p in raw.items():
+            base = p
+            if p.get("derivedFrom") and p.get("derivedFrom") in raw:
+                base = raw[p.get("derivedFrom")]
+            self.periph[name] = (p, base)
+
+    def regs(self, pname):
+        p, base = self.periph[pname]
+        addr = num(txt(p, "baseAddress"))
+        out = []
+        regs_el = base.find("registers")
+        if regs_el is None:
+            return out
+
+        def walk(container, offset, prefix):
+            for el in container:
+                if el.tag == "cluster":
+                    coff = num(txt(el, "addressOffset"), 0)
+                    for i, sub in enumerate(expand(el)):
+                        walk(el, offset + coff + sub[1], prefix + sub[0] + ".")
+                elif el.tag == "register":
+                    for rname, roff in expand(el):
+                        out.append({
+                            "name": prefix + rname,
+                            "addr": addr + offset + num(txt(el, "addressOffset"), 0) + roff,
+                            "size": num(txt(el, "size"), self.size),
+                            "reset": num(txt(el, "resetValue"), self.reset),
+                            "access": txt(el, "access", self.access),
+                            "desc": " ".join((txt(el, "description", "") or "").split()),
+                            "el": el,
+                        })
+        walk(regs_el, 0, "")
+        return out
+
+
+def expand(el):
+    """Handle SVD arrays: dim/dimIncrement/dimIndex with %s in name."""
+    name = txt(el, "name")
+    dim = num(txt(el, "dim"))
+    if not dim:
+        return [(name, 0)]
+    inc = num(txt(el, "dimIncrement"), 0)
+    idx = txt(el, "dimIndex")
+    if idx and "-" in idx and "," not in idx:
+        a, b = idx.split("-")
+        idxs = [str(i) for i in range(int(a), int(b) + 1)] if a.isdigit() else [chr(c) for c in range(ord(a), ord(b) + 1)]
+    elif idx:
+        idxs = idx.split(",")
+    else:
+        idxs = [str(i) for i in range(dim)]
+    return [(name.replace("[%s]", f"[{s}]").replace("%s", s), i * inc) for i, s in enumerate(idxs)]
+
+
+def fields(reg_el):
+    out = []
+    fe = reg_el.find("fields")
+    if fe is None:
+        return out
+    for f in fe.iter("field"):
+        if txt(f, "bitRange"):
+            m = re.match(r"\[(\d+):(\d+)\]", txt(f, "bitRange"))
+            msb, lsb = int(m.group(1)), int(m.group(2))
+        elif txt(f, "lsb") is not None:
+            lsb, msb = num(txt(f, "lsb")), num(txt(f, "msb"))
+        else:
+            lsb = num(txt(f, "bitOffset"), 0)
+            msb = lsb + num(txt(f, "bitWidth"), 1) - 1
+        enums = {}
+        for ev in f.iter("enumeratedValue"):
+            v = txt(ev, "value")
+            try:
+                if v:
+                    enums[num(v)] = txt(ev, "name", "")
+            except ValueError:
+                pass  # don't-care patterns like #1x0
+        out.append({"name": txt(f, "name"), "msb": msb, "lsb": lsb, "access": txt(f, "access"),
+                    "desc": " ".join((txt(f, "description", "") or "").split()), "enums": enums})
+    return sorted(out, key=lambda x: -x["msb"])
+
+
+def find_reg(dev, spec):
+    if "." not in spec:
+        sys.exit("use PERIPHERAL.REGISTER")
+    pname, rname = spec.split(".", 1)
+    pmatch = next((k for k in dev.periph if k.lower() == pname.lower()), None)
+    if not pmatch:
+        sys.exit(f"no peripheral {pname}")
+    for r in dev.regs(pmatch):
+        if r["name"].lower() == rname.lower():
+            return pmatch, r
+    sys.exit(f"no register {rname} in {pmatch}")
+
+
+def print_reg(pname, r, value=None):
+    print(f"{pname}.{r['name']} @ 0x{r['addr']:08X}  size={r['size']}  reset=0x{r['reset']:08X}  {r['access']}")
+    if r["desc"]:
+        print(f"  {r['desc']}")
+    for f in fields(r["el"]):
+        bits = f"[{f['msb']}:{f['lsb']}]" if f["msb"] != f["lsb"] else f"[{f['lsb']}]"
+        line = f"  {bits:<8} {f['name']:<16}"
+        if value is not None:
+            width = f["msb"] - f["lsb"] + 1
+            v = (value >> f["lsb"]) & ((1 << width) - 1)
+            ename = f["enums"].get(v)
+            line += f" = {v:#x}{f' ({ename})' if ename else ''}"
+        line += f"  {f['desc'][:90]}"
+        print(line)
+
+
+def cmd_find(a):
+    roots = [Path.cwd()] + [Path(p).expanduser() for p in a.paths]
+    seen = 0
+    for r in roots:
+        if not r.exists():
+            continue
+        res = subprocess.run(["find", str(r), "-iname", "*.svd", "-not", "-path", "*/node_modules/*"],
+                             capture_output=True, text=True)
+        for line in res.stdout.splitlines()[:200]:
+            print(line)
+            seen += 1
+    if not seen:
+        print("no .svd found. Get one from the vendor CMSIS pack, github.com/cmsis-svd/cmsis-svd-data, or the SDK.")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="svd", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("find"); s.add_argument("paths", nargs="*", default=[])
+    for name in ("peripherals", "show", "search", "decode", "addr"):
+        s = sub.add_parser(name); s.add_argument("svd")
+        if name == "peripherals": s.add_argument("filter", nargs="?")
+        if name == "show": s.add_argument("target")
+        if name == "search": s.add_argument("term")
+        if name == "decode": s.add_argument("target"); s.add_argument("value")
+        if name == "addr": s.add_argument("address")
+    a = ap.parse_args()
+    if a.cmd == "find":
+        return cmd_find(a)
+    dev = Dev(a.svd)
+    if a.cmd == "peripherals":
+        for name, (p, _) in sorted(dev.periph.items(), key=lambda kv: num(txt(kv[1][0], "baseAddress"), 0)):
+            if a.filter and a.filter.lower() not in name.lower():
+                continue
+            print(f"0x{num(txt(p, 'baseAddress')):08X}  {name:<14} {' '.join((txt(p, 'description', '') or '').split())[:80]}")
+    elif a.cmd == "show":
+        if "." in a.target:
+            print_reg(*find_reg(dev, a.target))
+        else:
+            pname = next((k for k in dev.periph if k.lower() == a.target.lower()), None) or sys.exit(f"no peripheral {a.target}")
+            for r in dev.regs(pname):
+                print(f"0x{r['addr']:08X}  {r['name']:<18} reset=0x{r['reset']:08X} {r['access']:<10} {r['desc'][:70]}")
+    elif a.cmd == "decode":
+        pname, r = find_reg(dev, a.target)
+        print_reg(pname, r, num(a.value))
+    elif a.cmd == "search":
+        t = a.term.lower()
+        for pname in dev.periph:
+            for r in dev.regs(pname):
+                if t in r["name"].lower() or t in r["desc"].lower():
+                    print(f"reg   {pname}.{r['name']} @ 0x{r['addr']:08X}  {r['desc'][:70]}")
+                for f in fields(r["el"]):
+                    if t in (f["name"] or "").lower() or t in f["desc"].lower():
+                        print(f"field {pname}.{r['name']}.{f['name']} [{f['msb']}:{f['lsb']}]  {f['desc'][:70]}")
+    elif a.cmd == "addr":
+        target = num(a.address)
+        for pname in dev.periph:
+            for r in dev.regs(pname):
+                if r["addr"] <= target < r["addr"] + r["size"] // 8:
+                    print_reg(pname, r)
+                    return
+        print("no register at that address")
+
+
+if __name__ == "__main__":
+    main()

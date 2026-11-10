@@ -1,0 +1,6 @@
+{
+  "name": "setups",
+  "description": "Setup manager for the personal-plugins marketplace: install setups per project, eject components to tweak, and promote tweaks back so every project gets them.",
+  "author": { "name": "OlirEswar" },
+  "keywords": ["setup", "marketplace", "sync"]
+}

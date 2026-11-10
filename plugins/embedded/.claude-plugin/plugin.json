@@ -1,0 +1,10 @@
+{
+  "name": "embedded",
+  "description": "Embedded/firmware setup: shared datasheet library with page-cited search, CMSIS-SVD register lookup, non-interactive build/flash/serial workflow, Cortex-M fault decoding, driver bring-up, firmware review, and guards against hanging monitors and irreversible eFuse/option-byte writes.",
+  "author": { "name": "OlirEswar" },
+  "keywords": ["embedded", "firmware", "mcu", "stm32", "esp32", "zephyr", "rtos", "datasheet"],
+  "dependencies": [
+    "clangd-lsp@claude-plugins-official",
+    "context7@claude-plugins-official"
+  ]
+}
