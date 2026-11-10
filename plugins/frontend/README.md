@@ -20,6 +20,8 @@ A setup for frontend-heavy and design-heavy projects.
 | skill | `figma-to-code` | Figma MCP context and variables mapped onto existing components and tokens, verified visually |
 | skill | `motion` | Timing and easing tokens, compositor-only animation, View Transitions, reduced motion |
 | skill | `component-architecture` | Composition, state placement, RSC split, effects, forms |
+| skill | `threejs` | Interactive three.js (r187) for sites: low-poly toon and ink outlines, drag/toss physics, scroll-linked 3D, perf and a11y |
+| skill | `doodle-paper-design` | Hand-drawn, paper-and-pencil art direction and components; triggers only when the brief asks for that feel |
 | agent | `ui-reviewer` | Read-only design QA in a fresh context |
 | agent | `accessibility-auditor` | Read-only full a11y audit |
 | agent | `performance-auditor` | Read-only perf profiling |
