@@ -66,5 +66,5 @@ if not bounded:
         if re.search(pat, cmd):
             emit("deny", f"[embedded guard] `{label}` is interactive and will hang this session. "
                  "Use `serial-tail <port> -b <baud> -t <seconds> [--until REGEX] [--reset]` to capture output, "
-                 "or wrap the command in `timeout <seconds> ...`.")
+                 "or wrap the command in `timeout <seconds> ...` (macOS: `gtimeout` from `brew install coreutils`).")
 sys.exit(0)

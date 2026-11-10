@@ -8,7 +8,7 @@ argument-hint: "[build|flash|monitor|all]"
 
 Get the exact commands from `HARDWARE.md` if it exists. Otherwise detect them (see `project-init`) and offer to record them there.
 
-**Never start an interactive monitor.** The plugin's guard hook blocks `idf.py monitor`, `screen`, `minicom`, `pio device monitor`, and similar. Capture output with:
+**Never start an interactive monitor.** (To bound any long-running command, use `timeout N cmd`. On macOS that's `gtimeout`, from coreutils.) The plugin's guard hook blocks `idf.py monitor`, `screen`, `minicom`, `pio device monitor`, and similar. Capture output with:
 ```
 serial-tail <port> -b 115200 -t 8 --reset                 # reset board, capture 8s of boot log
 serial-tail <port> -t 20 --until "(READY|panic|Guru|HardFault)"  # stop early on a marker (exit 3 if not seen)

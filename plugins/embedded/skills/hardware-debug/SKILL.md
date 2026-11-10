@@ -42,7 +42,7 @@ Put longer sequences in a `.gdb` file and run them with `-x script.gdb`. To atta
 - **Stack sizing**: compile with `-fstack-usage` (and `-Wstack-usage=N`) and check the RTOS high-water marks (`uxTaskGetStackHighWaterMark`, Zephyr thread analyzer). Paint the stack with a pattern and inspect it later.
 
 ## Logging without a UART
-SEGGER RTT and defmt (Rust), read with `probe-rs attach` through `timeout`, or with `JLinkRTTLogger`. Semihosting is slow and halts without a debugger, so never ship it.
+SEGGER RTT and defmt (Rust), read with `probe-rs attach` through `timeout`/`gtimeout`, or with `JLinkRTTLogger`. Semihosting is slow and halts without a debugger, so never ship it.
 
 ## Peripherals that "don't work"
 Check in this order: clock enabled → pins in the right AF/mode (`svd decode … GPIOx.MODER/AFR`) → peripheral registers after init (dump them with GDB and decode with `svd`) → interrupts enabled in both the peripheral and the NVIC, with the correct handler name (a weak default handler means a name typo) → errata. Then look at the wire: ask the user for a logic analyzer capture (sigrok-cli or Saleae export) for I2C, SPI, or UART. Check pull-ups, idle levels, clock polarity and phase, and addressing (7-bit vs 8-bit).

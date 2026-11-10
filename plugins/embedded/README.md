@@ -5,6 +5,7 @@ A setup for firmware and embedded projects (STM32/Cortex-M, ESP32, nRF, RP2040, 
 ## Prerequisites
 
 - Python 3 (all helper CLIs use only the stdlib)
+- macOS: `brew install coreutils` for `gtimeout`, used to bound long-running probe and monitor commands
 - `clangd` for C/C++ code intelligence (Xcode CLT or `brew install llvm`). Generate `compile_commands.json`: CMake `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, ESP-IDF and Zephyr produce it in `build/`, PlatformIO `pio run -t compiledb`
 - Datasheet text extraction: `brew install poppler` (best), otherwise `uv` (falls back to pypdf)
 - Your toolchain and probe tools as needed: `arm-none-eabi-gcc`, `openocd` / `probe-rs` / J-Link, ESP-IDF, west, PlatformIO
