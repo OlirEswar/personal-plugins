@@ -5,6 +5,7 @@ My personal Claude Code plugin marketplace. Each plugin is a **setup**: a bundle
 | Setup | For | Highlights |
 |---|---|---|
 | [`frontend`](plugins/frontend) | Web UI and design-heavy work | design-review loop, WCAG 2.2 audits, Core Web Vitals, design tokens, Figma-to-code, motion · Playwright, Chrome DevTools, shadcn, and Figma MCPs · TS LSP |
+| [`backend`](plugins/backend) | Production APIs and full-stack apps (pair with `frontend`) | tested Hono + Drizzle API scaffold (SQLite/Postgres, optional MongoDB) with full account auth, job queue, structured logs, Dockerfile and CI · OpenAPI contract and typed client · contract-first parallel frontend/backend workflow · `devctl` background dev servers · deploy skill, security and launch reviewers · guard against foreground servers and data wipes |
 | [`embedded`](plugins/embedded) | Firmware and MCU work | shared datasheet library with page citations, SVD register lookup, serial capture, Cortex-M fault decoder, firmware reviewer · guard against hanging monitors and eFuse burns · clangd |
 | [`setups`](plugins/setups) | The manager (install once, user scope) | `/setups:use`, `/setups:eject`, `/setups:promote`, `/setups:new`, `/setups:sync` |
 
@@ -22,7 +23,7 @@ The marketplace is added from the **local checkout**, so Claude loads the plugin
 
 In Claude Code, inside the project:
 ```
-/setups:use embedded          # or: frontend, or both
+/setups:use embedded          # or: frontend, backend, or several (frontend backend)
 ```
 Or from a terminal: `setups use embedded`. The CLI lives at `plugins/setups/bin/setups`, so add that folder to your PATH or alias it.
 

@@ -1,0 +1,29 @@
+{
+  "name": "backend",
+  "description": "Backend setup for production full-stack apps that humans can read and debug: tested TypeScript REST API scaffold (Hono + Drizzle + zod) on SQLite or Postgres with optional MongoDB, launch-ready account auth, durable job queue, structured logging, Dockerfile and CI; contract-first parallel frontend/backend workflow, devctl background dev servers, deploy and operations guidance, security and launch-readiness reviewers, and guards against foreground servers and data-destroying commands. Pairs with the frontend setup.",
+  "author": {
+    "name": "OlirEswar"
+  },
+  "keywords": [
+    "api",
+    "auth",
+    "backend",
+    "ci",
+    "database",
+    "deploy",
+    "docker",
+    "drizzle",
+    "fullstack",
+    "hono",
+    "mongodb",
+    "postgres",
+    "production",
+    "rest",
+    "security",
+    "sqlite"
+  ],
+  "dependencies": [
+    "context7@claude-plugins-official",
+    "typescript-lsp@claude-plugins-official"
+  ]
+}

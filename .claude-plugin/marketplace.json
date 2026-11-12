@@ -5,7 +5,9 @@
   "owner": {
     "name": "OlirEswar"
   },
-  "allowCrossMarketplaceDependenciesOn": ["claude-plugins-official"],
+  "allowCrossMarketplaceDependenciesOn": [
+    "claude-plugins-official"
+  ],
   "plugins": [
     {
       "name": "setups",
@@ -17,6 +19,12 @@
       "name": "frontend",
       "description": "Frontend/design setup: design review, accessibility, performance, design systems, Figma-to-code, browser + shadcn + Figma MCP servers.",
       "source": "./plugins/frontend",
+      "category": "development"
+    },
+    {
+      "name": "backend",
+      "description": "Backend/full-stack setup: production-ready, human-readable Hono + Drizzle API scaffold (SQLite/Postgres, optional MongoDB) with account auth, job queue, structured logs, Dockerfile and CI; OpenAPI contract for the frontend; parallel dev servers via devctl; deploy, security and launch-readiness reviews.",
+      "source": "./plugins/backend",
       "category": "development"
     },
     {
